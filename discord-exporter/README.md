@@ -27,4 +27,3 @@ python src/main.py
 \`\`\`
 
 First run will open your browser for Google OAuth; subsequent runs use \`token.pickle\`.
-
