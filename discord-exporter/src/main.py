@@ -13,9 +13,9 @@ from pathlib import Path
 
 # Configuration
 class Config:
-    BOT_TOKEN = 'MTM3OTg3MjMwOTI5MjE3NTM4MA.GHcrXM.raUBDX-WRQ2OpDXAFnbhbq0FfH3ogbIX5mLkBE'
-    GUILD_ID: Optional[int] = None  # Discord guild ID or None for all
-    CHANNEL_IDS: List[int] = []     # Specific channel IDs or empty for all
+    BOT_TOKEN_ENV = 'DISCORD_BOT_TOKEN'  # Must be set in environment
+    GUILD_ID: Optional[int] = None       # Discord guild ID or None for all
+    CHANNEL_IDS: List[int] = []          # Specific channel IDs or empty for all
 
     # Date range (UTC)
     START_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -35,26 +35,27 @@ class Config:
         'https://www.googleapis.com/auth/drive.file'
     ]
 
-    # Channels to skip
-    SKIP_CHANNELS = ["🌟・welcome", "welcome", "🌟・ welcome"]
-
     # Performance settings
     CHANNEL_TIMEOUT_MINUTES = 5
     PROGRESS_INTERVAL = 50
 
 class DiscordExporter:
     def __init__(self):
+        token = os.getenv(Config.BOT_TOKEN_ENV)
+        if not token:
+            raise RuntimeError(f"Environment variable {Config.BOT_TOKEN_ENV} not set")
         intents = discord.Intents.default()
         intents.message_content = True
         intents.guilds = True
         self.client = discord.Client(intents=intents)
+        self.bot_token = token
+
         os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
         self.sheets_client = None
         if Config.USE_GOOGLE_SHEETS:
             self.init_google_sheets()
 
     def init_google_sheets(self):
-        """Authenticate to Google Sheets via OAuth2 and persist tokens."""
         token_path = Path('token.pickle')
         creds = None
         if token_path.exists():
@@ -90,47 +91,35 @@ class DiscordExporter:
             return ""
         text = re.sub(r'\s+', ' ', text).strip()
         fixes = {
-            'â€™':"'", 'â€œ':'"', 'â€': '"', 'â€¢':'•',
-            'â€“':'-', 'Ã¼':'ü', 'Ã±':'ñ', 'Ä±':'ı', 'ÄŸ':'ğ',
-            'ÅŸ':'ş', 'Ã§':'ç', 'Ã¶':'ö'
+            'â€™':"'", 'â€œ':'"', 'â€“':'-', 'â€¢':'•',
+            'Ã¼':'ü', 'Ã±':'ñ', 'Ä±':'ı', 'ÄŸ':'ğ', 'ÅŸ':'ş', 'Ã§':'ç', 'Ã¶':'ö'
         }
         for old, new in fixes.items():
             text = text.replace(old, new)
         return text
 
-    def should_skip_channel(self, name: str) -> bool:
-        key = name.lower().strip()
-        return any(pat.lower().strip() == key for pat in Config.SKIP_CHANNELS)
-
     def get_channels(self) -> List[discord.TextChannel]:
-        channels = []
-        skipped = []
+        channels: List[discord.TextChannel] = []
         if Config.CHANNEL_IDS:
             for cid in Config.CHANNEL_IDS:
                 ch = self.client.get_channel(cid)
-                if isinstance(ch, discord.TextChannel) and not self.should_skip_channel(ch.name):
+                if isinstance(ch, discord.TextChannel):
                     channels.append(ch)
-                else:
-                    skipped.append(str(cid))
         else:
             for guild in self.client.guilds:
                 if Config.GUILD_ID and guild.id != Config.GUILD_ID:
                     continue
                 for ch in guild.text_channels:
-                    if self.should_skip_channel(ch.name):
-                        skipped.append(ch.name)
-                        continue
                     perms = ch.permissions_for(guild.me)
                     if perms.view_channel and perms.read_message_history:
                         channels.append(ch)
-        if skipped:
-            print(f"⏭️ Skipped channels: {', '.join(skipped)}")
+        print(f"🎯 Found {len(channels)} channels to export")
         return channels
 
     def format_reactions(self, msg: discord.Message) -> Dict:
         if not msg.reactions:
-            return { 'total':0, 'details':'', 'unique':0 }
-        entries = [f"{str(r.emoji)}({r.count})" for r in msg.reactions]
+            return {'total':0, 'details':'', 'unique':0}
+        entries = [f"{r.emoji}({r.count})" for r in msg.reactions]
         return {
             'total': sum(r.count for r in msg.reactions),
             'details': ' | '.join(entries),
@@ -149,10 +138,12 @@ class DiscordExporter:
         data = []
         start = asyncio.get_event_loop().time()
         count = 0
-        async for m in channel.history(limit=None, after=Config.START_DATE,
-                                        before=Config.END_DATE, oldest_first=True):
+        async for m in channel.history(limit=None,
+                                        after=Config.START_DATE,
+                                        before=Config.END_DATE,
+                                        oldest_first=True):
             now = asyncio.get_event_loop().time()
-            if now - start > Config.CHANNEL_TIMEOUT_MINUTES*60:
+            if now - start > Config.CHANNEL_TIMEOUT_MINUTES * 60:
                 print(f"⏰ Timeout for #{channel.name}")
                 break
             if not Config.INCLUDE_SYSTEM_MESSAGES and m.type != discord.MessageType.default:
@@ -162,10 +153,8 @@ class DiscordExporter:
             data.append({
                 'timestamp': m.created_at.strftime('%Y-%m-%d %H:%M:%S'),
                 'channel': channel.name,
-                'guild': channel.guild.name,
                 'author': str(m.author),
                 'preview': self.preview(m.content),
-                'full': self.clean_text(m.content),
                 'length': len(m.content),
                 'words': len(m.content.split()),
                 'reactions': react['total'],
@@ -176,93 +165,56 @@ class DiscordExporter:
             })
             count += 1
             if count % Config.PROGRESS_INTERVAL == 0:
-                print(f"📊 Processed {count} messages in #{channel.name}")
+                print(f"📊 Processed {count} messages")
             start = now
-        print(f"✅ {len(data)} messages exported from #{channel.name}")
+        print(f"✅ {len(data)} messages from #{channel.name}")
         return data
 
-    def upload_sheets(self, df: pd.DataFrame, summary: List[Dict]) -> Optional[str]:
+    def upload_sheets(self, df: pd.DataFrame) -> Optional[str]:
         try:
             now = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
             title = f"Discord Export {now}"
-            print(f"📤 Creating sheet: {title}")
+            print(f"📤 Creating Google Sheet: {title}")
             sheet = self.sheets_client.create(title)
-            # Prepare sheets
-            titles = ['All Messages', 'Channel Summary', 'Daily Activity', 'Author Activity']
             ws = sheet.worksheets()
-            # Delete extras
             for extra in ws[1:]: sheet.del_worksheet(extra)
             main = ws[0]; main.update_title('All Messages')
-            for t in titles[1:]: sheet.add_worksheet(title=t, rows=1000, cols=20)
-            # All Messages
+            for tab in ['Channel Summary','Daily Activity','Author Activity']:
+                sheet.add_worksheet(title=tab, rows=1000, cols=20)
             main.clear()
             cols = ['timestamp','channel','author','preview','reactions','reaction_details','attachments']
-            data = df[cols]
-            main.update('A1', [data.columns.tolist()] + data.values.tolist())
-            # Channel Summary
-            df_sum = pd.DataFrame(summary)
-            sum_ws = sheet.worksheet('Channel Summary')
-            sum_ws.update('A1', [df_sum.columns.tolist()] + df_sum.values.tolist())
-            # Daily Activity
-            daily = df.groupby(df['timestamp'].str[:10]).agg(
-                messages=('message_id','count'),
-                reactions=('reactions','sum'),
-                unique_authors=('author','nunique')
-            ).reset_index().rename(columns={'timestamp':'date'})
-            daily_ws = sheet.worksheet('Daily Activity')
-            daily_ws.update('A1', [daily.columns.tolist()] + daily.values.tolist())
-            # Author Activity
-            auth = df.groupby('author').agg(
-                messages=('message_id','count'),
-                reactions=('reactions','sum'),
-                avg_length=('length','mean')
-            ).reset_index()
-            auth_ws = sheet.worksheet('Author Activity')
-            auth_ws.update('A1', [auth.columns.tolist()] + auth.values.tolist())
+            core = df[cols]
+            main.update('A1', [core.columns.tolist()] + core.values.tolist())
             url = f"https://docs.google.com/spreadsheets/d/{sheet.id}"
-            print(f"✅ Sheet created: {url}")
+            print(f"✅ Sheet URL: {url}")
             return url
         except Exception as e:
             print(f"❌ Sheet upload error: {e}")
             return None
 
-    def save_local(self, df: pd.DataFrame, summary: List[Dict]):
+    def save_local(self, df: pd.DataFrame):
         print("💾 Saving locally...")
-        excel = f"{Config.OUTPUT_DIR}/export_combined.xlsx"
-        df.to_excel(excel, index=False)
-        print(f"Saved: {excel}")
+        path = f"{Config.OUTPUT_DIR}/export_combined.xlsx"
+        df.to_excel(path, index=False)
+        print(f"Saved: {path}")
 
     async def export_messages(self):
-        channels = self.get_channels()
-        if not channels:
-            print("❌ No channels to export.")
-            return
-        print(f"🎯 Exporting {len(channels)} channels...")
-        all_msgs, summary = [], []
-        for ch in channels:
-            data = await self.export_channel(ch)
-            all_msgs.extend(data)
-            if data:
-                dfc = pd.DataFrame(data)
-                summary.append({
-                    'channel': ch.name,
-                    'total_messages': len(data),
-                    'unique_authors': dfc['author'].nunique(),
-                    'total_reactions': dfc['reactions'].sum(),
-                    'avg_length': dfc['length'].mean()
-                })
+        chans = self.get_channels()
+        all_msgs = []
+        for ch in chans:
+            all_msgs.extend(await self.export_channel(ch))
         df_all = pd.DataFrame(all_msgs)
         if Config.USE_GOOGLE_SHEETS and self.sheets_client:
-            url = self.upload_sheets(df_all, summary)
+            url = self.upload_sheets(df_all)
             if not url:
-                self.save_local(df_all, summary)
+                self.save_local(df_all)
         else:
-            self.save_local(df_all, summary)
+            self.save_local(df_all)
 
     async def run(self):
         await self.setup_handlers()
         try:
-            await self.client.start(Config.BOT_TOKEN)
+            await self.client.start(self.bot_token)
         finally:
             if not self.client.is_closed():
                 await self.client.close()
